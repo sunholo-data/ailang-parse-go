@@ -1,0 +1,314 @@
+# ailang-parse-go
+
+Go client and MCP server for the [AILANG Parse](https://www.sunholo.com/ailang-parse/) document parsing API. Parse 16 formats (including LaTeX/arXiv and RTF), generate 8 — standard library only.
+
+## Install
+
+```bash
+go get github.com/sunholo-data/ailang-parse-go
+```
+
+## MCP Server (Claude Desktop, Cursor, VS Code)
+
+Install the CLI binary and run as a stdio MCP server that bridges to the hosted AILANG Parse API:
+
+```bash
+go install github.com/sunholo-data/ailang-parse-go/cmd/ailang-parse@latest
+```
+
+```json
+{
+  "mcpServers": {
+    "ailang-parse": {
+      "command": "ailang-parse",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+Add to `claude_desktop_config.json` (Claude Desktop), `.cursor/mcp.json` (Cursor), or `.vscode/settings.json` (VS Code). Provides 7 tools: parse, convert, formats, estimate, auth, auth-poll, and account.
+
+## Quick Start
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+
+	docparse "github.com/sunholo-data/ailang-parse-go"
+)
+
+func main() {
+	client := docparse.New("dp_your_key_here")
+	ctx := context.Background()
+
+	// Parse a document
+	result, err := client.Parse(ctx, "report.docx")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Printf("%d blocks, format: %s\n", len(result.Blocks), result.Format)
+	for _, block := range result.Blocks {
+		switch block.Type {
+		case "heading":
+			fmt.Printf("  H%d: %s\n", block.Level, block.Text)
+		case "table":
+			fmt.Printf("  Table: %d cols, %d rows\n", len(block.Headers), len(block.Rows))
+		case "change":
+			fmt.Printf("  %s by %s: %s\n", block.ChangeType, block.Author, block.Text)
+		default:
+			if len(block.Text) > 80 {
+				fmt.Printf("  %s: %s...\n", block.Type, block.Text[:80])
+			} else {
+				fmt.Printf("  %s: %s\n", block.Type, block.Text)
+			}
+		}
+	}
+}
+```
+
+## Parse Documents
+
+```go
+// Default (blocks)
+result, err := client.Parse(ctx, "report.docx")
+
+// With output format
+result, err := client.Parse(ctx, "report.docx", docparse.ParseOptions{
+	OutputFormat: "markdown",
+})
+
+// Markdown with section metadata
+result, err := client.Parse(ctx, "report.docx", docparse.ParseOptions{
+	OutputFormat: "markdown+metadata",
+})
+fmt.Println(result.Markdown)
+for _, s := range result.Sections {
+	fmt.Printf("  %s: %s...\n", s.Heading, s.Markdown[:60])
+}
+
+// Upload a local file (multipart)
+result, err := client.ParseFile(ctx, "local/report.docx")
+
+// Parse from a signed URL (GCS, S3, Azure Blob — no local file needed)
+result, err := client.ParseURL(ctx,
+	"https://storage.googleapis.com/bucket/doc.docx?X-Goog-Signature=...",
+	"markdown+metadata",
+)
+
+// Access structured data
+fmt.Println(result.Status)           // "success"
+fmt.Println(result.Metadata.Title)   // Document title
+fmt.Println(result.Summary.Tables)   // Number of tables
+```
+
+## PDF Backends
+
+`Parse`, `ParseURL` and `ParseFile` take `ParseOptions.PDFBackend` (and
+`Convert` takes `ConvertOptions.PDFBackend`). It only affects PDF sources:
+
+| `PDFBackend` | How the PDF is read | Billed as |
+|---|---|---|
+| `""` (default) | server default, currently `pdftotext` | a standard request |
+| `"pdftotext"` | text layer, deterministic | a standard request |
+| `"poppler"` | structure from poppler: headings, lists, tables, pictures, header/footer | a standard request |
+| `"ai"` | page images are sent to Google Gemini via Vertex AI; needed for scanned or image-only PDFs | an **AI request** (counts against the AI quota) |
+
+```go
+scanned, err := client.ParseFile(ctx, "scan.pdf", docparse.ParseOptions{PDFBackend: "ai"})
+report, err := client.ParseURL(ctx, "https://example.com/report.pdf", "blocks",
+	docparse.ParseOptions{PDFBackend: "poppler"})
+```
+
+`ParseURL`'s trailing `ParseOptions` is optional, so existing three-argument
+calls compile unchanged.
+
+The model and processing region used for `"ai"` are listed by
+`GET /api/v1/capabilities` under `ai_processing`.
+
+A scanned PDF read with a text backend (the default) fails with error code
+`PDF_TEXT_LAYER_SPARSE` instead of returning blank pages; retry it with `PDFBackend: "ai"`.
+
+## File Size Limits
+
+| | Free | Pro | Business |
+|---|---|---|---|
+| Per-file limit | 10 MB | 25 MB | 50 MB |
+| Direct upload (`ParseFile`, compat `Partition`) | 10 MB | 25 MB | **32 MB** |
+| `SourceURL` / `ParseURL` | 10 MB | 25 MB | 50 MB |
+| `POST /api/v1/upload/url` + `gcs_ref` | — | — | 50 MB |
+
+Direct upload is limited to 32 MB (`docparse.MaxDirectUploadBytes`,
+33,554,432 bytes) by the hosting platform on every tier. A request above that
+never reaches the API, so the SDK checks the size first and returns a
+`*docparse.DocParseError` with `Code == docparse.CodeFileTooLarge`
+(`"FILE_TOO_LARGE"`) without sending anything. If the platform rejects an
+upload anyway (HTTP 413 with an HTML page), the SDK returns the same error.
+
+Larger files (Business, up to 50 MB) go by URL instead:
+
+```go
+result, err := client.ParseFile(ctx, "big.pdf")
+var dpe *docparse.DocParseError
+if errors.As(err, &dpe) && dpe.Code == docparse.CodeFileTooLarge {
+	// A signed or public https URL; the server fetches it.
+	result, err = client.ParseURL(ctx, signedURL, "blocks")
+	// Or, on Business: POST /api/v1/upload/url, PUT the file to the
+	// returned upload_url, then:
+	result, err = client.Parse(ctx, "", docparse.ParseOptions{GCSRef: "gs://..."})
+}
+```
+
+## Response Metadata
+
+Every parse result includes quota and request metadata from response headers:
+
+```go
+result, err := client.Parse(ctx, "report.docx")
+meta := result.ResponseMeta
+
+fmt.Println(meta.RequestID)           // "req_abc123"
+fmt.Println(meta.Tier)                // "free", "pro", or "business"
+fmt.Println(meta.QuotaRemainingDay)   // Requests left today
+fmt.Println(meta.QuotaRemainingMonth) // Requests left this month
+fmt.Println(meta.QuotaRemainingAI)    // AI requests remaining
+fmt.Println(meta.Format)              // Detected input format ("docx", etc.)
+fmt.Println(meta.Replayable)          // Whether this request can be replayed
+```
+
+## Health & Formats
+
+```go
+health, err := client.Health(ctx)
+fmt.Println(health.Status)   // "healthy"
+fmt.Println(health.Version)  // "0.7.0"
+
+formats, err := client.Formats(ctx)
+fmt.Println(formats.Parse)       // ["docx", "pptx", ...]
+fmt.Println(formats.AIRequired)  // ["pdf", "png", "jpg", ...]
+```
+
+## API Key Management
+
+API key resolution (checked in order):
+1. Explicit `apiKey` parameter to `New()`
+2. `DOCPARSE_API_KEY` environment variable
+3. Saved credentials in `~/.config/ailang-parse/credentials.json`
+
+Use the device auth flow to get an API key. The user signs in once — the key is saved automatically and reused in future sessions.
+
+```go
+// First time: DeviceAuth() opens browser, user signs in, key saved to disk
+client := docparse.New("")
+result, err := client.DeviceAuth(ctx, "my-agent")
+
+// Future sessions: key auto-loaded from ~/.config/ailang-parse/credentials.json
+client := docparse.New("")
+parsed, err := client.Parse(ctx, "report.docx")
+
+// Usage / Rotate / Revoke
+usage, err := client.Keys.Usage(ctx, "keyId123", "user123")
+newKey, err := client.Keys.Rotate(ctx, "keyId123", "user123")
+err = client.Keys.Revoke(ctx, "keyId123", "user123")
+```
+
+## Migrating from Unstructured
+
+```go
+// Create an Unstructured-compatible client
+uc := docparse.NewUnstructuredClient(
+	"https://api.parse.sunholo.com",
+)
+
+elements, err := uc.Partition(ctx, "report.docx")
+for _, el := range elements {
+	fmt.Printf("%s: %s\n", el.Type, el.Text)
+}
+```
+
+## Configuration
+
+```go
+client := docparse.New("dp_your_key",
+	docparse.WithBaseURL("https://your-deployment.run.app"),
+	docparse.WithHTTPClient(&http.Client{Timeout: 120 * time.Second}),
+)
+```
+
+### Retry on transient failures
+
+`Parse` / `ParseFile` can retry transient AI-provider failures (the server
+returns `502`/`503`/`504`, and marks safe-to-retry `5xx` with
+`X-AilangParse-Replayable`). Retry is **off by default** — opt in with
+`WithRetry`. Zero-valued fields fall back to the defaults, so
+`RetryPolicy{MaxRetries: 3}` is enough:
+
+```go
+client := docparse.New("dp_your_key",
+	docparse.WithRetry(docparse.RetryPolicy{
+		MaxRetries:  3,                 // default 0 (no retry)
+		BackoffBase: 1 * time.Second,   // delay N = min(base * 2^N, max)
+		BackoffMax:  30 * time.Second,
+	}),
+)
+```
+
+A 5xx carrying `X-AilangParse-Replayable: true` is always retried when retries
+are enabled (the server only sets it on responses safe to re-attempt).
+
+## Error Handling
+
+```go
+import "errors"
+
+result, err := client.Parse(ctx, "file.docx")
+if err != nil {
+	var authErr *docparse.AuthError
+	var quotaErr *docparse.QuotaError
+	var parseErr *docparse.DocParseError
+
+	switch {
+	case errors.As(err, &authErr):
+		fmt.Println("Bad API key")
+	case errors.As(err, &quotaErr):
+		fmt.Println("Quota exceeded")
+	case errors.As(err, &parseErr):
+		fmt.Printf("API error: %s\n", parseErr.Message)
+		fmt.Printf("  code: %s\n", parseErr.Code)              // e.g. "FILE_TOO_LARGE"
+		fmt.Printf("  suggested fix: %s\n", parseErr.SuggestedFix)
+		fmt.Printf("  details: %v\n", parseErr.Details)    // Structured error details
+		fmt.Printf("  request ID: %s\n", parseErr.RequestID) // For support/debugging
+	}
+}
+```
+
+## Block Types
+
+All 9 block types in the `Block` struct:
+
+| Type | Key Fields |
+|------|-----------|
+| `text` | `Text`, `Style`, `Level` |
+| `heading` | `Text`, `Level` (1-6) |
+| `table` | `Headers`, `Rows` ([][]Cell) |
+| `list` | `Items`, `Ordered` |
+| `image` | `Description`, `Mime`, `DataLength` |
+| `audio` | `Transcription`, `Mime` |
+| `video` | `Description`, `Mime` |
+| `section` | `Kind`, `Children` ([]Block) |
+| `change` | `ChangeType`, `Author`, `Date`, `Text` |
+
+## License
+
+Apache 2.0 — see [LICENSE](../../LICENSE) for details.
+
+## Links
+
+- [AILANG Parse Website](https://www.sunholo.com/ailang-parse/)
+- [API Documentation](https://www.sunholo.com/ailang-parse//api.html)
+- [GitHub](https://github.com/sunholo-data/ailang-parse-go)
